@@ -409,18 +409,19 @@ class CineVault:
         self.player_area = tk.Frame(self.root, bg="#000", width=0)
         # built lazily
 
+        self._current_page = None
         self._show_page("home")
 
     # ── Sidebar ───────────────────────────────────────────────────────────────
     def _build_sidebar(self):
         sb = self.sidebar
         # Logo
-        logo = tk.Frame(sb, bg="#08080f", pady=20)
+        logo = tk.Frame(sb, bg="#08080f", pady=18)
         logo.pack(fill="x")
-        tk.Label(logo, text="CINE", font=("Georgia",18,"bold"),
+        tk.Label(logo, text="CINEVAULT", font=("Georgia",20,"bold"),
                  bg="#08080f", fg=ACCENT).pack()
-        tk.Label(logo, text="VAULT", font=("Georgia",10),
-                 bg="#08080f", fg=MUTED).pack()
+        tk.Label(logo, text="your media, your way",
+                 font=("Segoe UI",8), bg="#08080f", fg=MUTED).pack()
         tk.Frame(sb, bg=ACCENT, height=1).pack(fill="x", padx=20)
 
         nav_items = [
@@ -451,10 +452,10 @@ class CineVault:
     # ── Pages ─────────────────────────────────────────────────────────────────
     def _build_home(self):
         p = self.pages["home"]
-        WavyBackground(p).place(relx=0,rely=0,relwidth=1,relheight=1)
+        # WavyBackground disabled — caused click-blocking on Windows
 
         scroll = _ScrollFrame(p)
-        scroll.place(relx=0,rely=0,relwidth=1,relheight=1)
+        scroll.pack(fill="both", expand=True)
         inner = scroll.inner
 
         tk.Label(inner, text="Continue Watching", font=F_HEAD,
@@ -469,17 +470,17 @@ class CineVault:
 
     def _build_movies_page(self):
         p = self.pages["movies"]
-        WavyBackground(p).place(relx=0,rely=0,relwidth=1,relheight=1)
+        # WavyBackground disabled — caused click-blocking on Windows
         self._build_library_page(p, "movies")
 
     def _build_series_page(self):
         p = self.pages["series"]
-        WavyBackground(p).place(relx=0,rely=0,relwidth=1,relheight=1)
+        # WavyBackground disabled — caused click-blocking on Windows
         self._build_library_page(p, "series")
 
     def _build_library_page(self, parent, kind):
         top = tk.Frame(parent, bg=BG)
-        top.place(relx=0,rely=0,relwidth=1,relheight=1)
+        top.pack(fill="both", expand=True)
 
         # toolbar
         bar = tk.Frame(top, bg=BG2, pady=8)
@@ -538,9 +539,9 @@ class CineVault:
 
     def _build_history_page(self):
         p = self.pages["history"]
-        WavyBackground(p).place(relx=0,rely=0,relwidth=1,relheight=1)
+        # WavyBackground disabled — caused click-blocking on Windows
         overlay = tk.Frame(p, bg=BG)
-        overlay.place(relx=0,rely=0,relwidth=1,relheight=1)
+        overlay.pack(fill="both", expand=True)
 
         tk.Label(overlay, text="Watch History", font=F_HEAD,
                  bg=BG, fg=TEXT, pady=16).pack(anchor="w", padx=20)
@@ -568,9 +569,9 @@ class CineVault:
 
     def _build_settings_page(self):
         p = self.pages["settings"]
-        WavyBackground(p).place(relx=0,rely=0,relwidth=1,relheight=1)
+        # WavyBackground disabled — caused click-blocking on Windows
         overlay = tk.Frame(p, bg=BG)
-        overlay.place(relx=0,rely=0,relwidth=1,relheight=1)
+        overlay.pack(fill="both", expand=True)
 
         tk.Label(overlay, text="⚙  Settings", font=F_HEAD,
                  bg=BG, fg=TEXT, pady=16).pack(anchor="w", padx=20)
@@ -1151,9 +1152,10 @@ class CineVault:
 
     # ── Navigation ────────────────────────────────────────────────────────────
     def _show_page(self, name):
-        for n, f in self.pages.items():
-            f.place_forget()
-        self.pages[name].place(relx=0,rely=0,relwidth=1,relheight=1)
+        if self._current_page:
+            self._current_page.pack_forget()
+        self.pages[name].pack(fill="both", expand=True)
+        self._current_page = self.pages[name]
         for n, btn in self.nav_btns.items():
             btn.configure(bg=CARD if n==name else "#08080f",
                           fg=TEXT if n==name else TEXT2)
