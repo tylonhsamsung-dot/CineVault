@@ -1,7 +1,6 @@
 """
 CineVault - Netflix-style Media Player
-Dark theme with red wavy accent background
-Embedded VLC playback, watch tracking, resume, mini-player mode
+Splash screen, embedded VLC, thumbnails, series drill-down, watch tracking
 """
 
 import os, re, sys, json, time, math, threading, pathlib, subprocess, shutil
@@ -9,32 +8,35 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import tkinter.font as tkfont
 
-# ── deps (bundled in exe — imported directly) ────────────────────────────────
-try:
-    import requests
-    REQUESTS_OK = True
-except ImportError:
-    REQUESTS_OK = False
-
+# ── deps ──────────────────────────────────────────────────────────────────────
 try:
     from PIL import Image, ImageTk, ImageDraw, ImageFilter
     PIL_OK = True
 except ImportError:
     PIL_OK = False
 
+try:
+    import requests
+    REQUESTS_OK = True
+except ImportError:
+    REQUESTS_OK = False
+
 # ═══════════════════════════════════════════════════════════════════════════════
-#  CONSTANTS & PATHS
+#  CONSTANTS
 # ═══════════════════════════════════════════════════════════════════════════════
 CONFIG_PATH  = pathlib.Path.home() / ".cinevault_config.json"
 DB_PATH      = pathlib.Path.home() / ".cinevault_db.json"
-WATCHED_MARK = 0.95   # 95% = finished
+THUMB_DIR    = pathlib.Path.home() / ".cinevault_thumbs"
+THUMB_DIR.mkdir(exist_ok=True)
+WATCHED_MARK = 0.95
 VIDEO_EXT    = {'.mp4','.mkv','.avi','.mov','.wmv','.m4v','.ts','.flv'}
+CARD_W, CARD_H = 200, 150
+THUMB_W, THUMB_H = 200, 112
 
-# ── colours ───────────────────────────────────────────────────────────────────
 BG       = "#0a0a0f"
 BG2      = "#0f0f1a"
 CARD     = "#141420"
-CARD_H   = "#1e1e30"
+CARD_H_C = "#1e1e30"
 ACCENT   = "#e50914"
 ACCENT2  = "#ff2d3a"
 GOLD     = "#f5c518"
@@ -43,11 +45,11 @@ TEXT     = "#f0f0f0"
 TEXT2    = "#a0a0c0"
 GREEN    = "#46d369"
 PROG_BG  = "#2a2a3a"
+SIDEBAR  = "#08080f"
 
-# ── fonts ─────────────────────────────────────────────────────────────────────
 F_TITLE  = ("Georgia", 22, "bold")
 F_HEAD   = ("Georgia", 13, "bold")
-F_CARD   = ("Segoe UI", 10, "bold")
+F_CARD   = ("Segoe UI", 9, "bold")
 F_SMALL  = ("Segoe UI", 8)
 F_UI     = ("Segoe UI", 9)
 F_UI_B   = ("Segoe UI Semibold", 9)
@@ -70,88 +72,51 @@ def load_db():   return load_json(DB_PATH, {"movies":{},"series":{},"history":[]
 def save_db(d):  save_json(DB_PATH, d)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  LIBRARY SCANNER
-# ═══════════════════════════════════════════════════════════════════════════════
-def scan_movies(folder):
-    """Return list of {title, path, year} dicts."""
-    movies = []
-    if not folder or not os.path.isdir(folder): return movies
-    for fname in sorted(os.listdir(folder)):
-        fpath = os.path.join(folder, fname)
-        if os.path.isfile(fpath) and os.path.splitext(fname)[1].lower() in VIDEO_EXT:
-            name, _ = os.path.splitext(fname)
-            m = re.search(r'\((\d{4})\)', name)
-            year  = m.group(1) if m else ""
-            title = re.sub(r'\(\d{4}\)', '', name).strip()
-            movies.append({"title": title, "year": year, "path": fpath})
-    return movies
-
-def scan_series(folder):
-    """Return list of {show, seasons:{1:[{ep,path}]}} dicts."""
-    series = []
-    if not folder or not os.path.isdir(folder): return series
-    for show in sorted(os.listdir(folder)):
-        show_path = os.path.join(folder, show)
-        if not os.path.isdir(show_path): continue
-        seasons = {}
-        for item in sorted(os.listdir(show_path)):
-            item_path = os.path.join(show_path, item)
-            if os.path.isdir(item_path):
-                m = re.match(r'[Ss]eason\s*(\d+)', item)
-                if m:
-                    snum = int(m.group(1))
-                    eps  = []
-                    for ep in sorted(os.listdir(item_path)):
-                        ep_path = os.path.join(item_path, ep)
-                        if os.path.isfile(ep_path) and os.path.splitext(ep)[1].lower() in VIDEO_EXT:
-                            em = re.match(r'(\d)(\d{2})', os.path.splitext(ep)[0])
-                            ep_num = int(em.group(2)) if em else 0
-                            eps.append({"ep": ep_num, "file": ep, "path": ep_path})
-                    if eps:
-                        seasons[snum] = eps
-        if seasons:
-            series.append({"show": show, "seasons": seasons, "path": show_path})
-    return series
-
-def fmt_duration(secs):
-    if not secs: return "0:00"
-    h = int(secs)//3600; m = (int(secs)%3600)//60; s = int(secs)%60
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  VLC WRAPPER
+#  VLC WRAPPER — accepts vlc.exe OR libvlc.dll
 # ═══════════════════════════════════════════════════════════════════════════════
 class VLCPlayer:
-    def __init__(self, vlc_path):
-        self.vlc_path  = vlc_path
+    def __init__(self):
         self.instance  = None
         self.player    = None
         self.available = False
-        self._load()
+        self._vlc      = None
 
-    def _load(self):
+    def load(self, path):
+        """Accept vlc.exe or libvlc.dll — resolve the dll automatically."""
         try:
-            vlc_dir = os.path.dirname(self.vlc_path)
-            if vlc_dir not in sys.path: sys.path.insert(0, vlc_dir)
-            os.environ.setdefault("PYTHON_VLC_LIB_PATH", self.vlc_path)
-            import ctypes
+            vlc_dir = os.path.dirname(os.path.abspath(path))
+            # If user pointed to vlc.exe, find libvlc.dll in the same folder
+            dll = os.path.join(vlc_dir, "libvlc.dll")
+            if not os.path.isfile(dll):
+                # Try the path itself if it ends in .dll
+                if path.lower().endswith(".dll") and os.path.isfile(path):
+                    dll = path
+                    vlc_dir = os.path.dirname(dll)
+                else:
+                    return False, "libvlc.dll not found in VLC folder"
+
+            os.environ["PYTHON_VLC_LIB_PATH"] = dll
+            if vlc_dir not in sys.path:
+                sys.path.insert(0, vlc_dir)
             if sys.platform == "win32":
-                os.add_dll_directory(vlc_dir)
+                try: os.add_dll_directory(vlc_dir)
+                except: pass
+
             import vlc as _vlc
             self._vlc      = _vlc
-            self.instance  = _vlc.Instance("--no-xlib","--quiet")
+            self.instance  = _vlc.Instance("--no-xlib", "--quiet")
             self.player    = self.instance.media_player_new()
             self.available = True
+            return True, "OK"
         except Exception as e:
             self.available = False
+            return False, str(e)
 
     def set_window(self, hwnd):
         if not self.available: return
         try:
-            if sys.platform == "win32":
-                self.player.set_hwnd(hwnd)
-            else:
-                self.player.set_xwindow(hwnd)
+            if sys.platform == "win32": self.player.set_hwnd(hwnd)
+            else:                       self.player.set_xwindow(hwnd)
         except: pass
 
     def play(self, path, start_pos=0):
@@ -176,7 +141,7 @@ class VLCPlayer:
 
     def seek(self, pct):
         if self.available:
-            try: self.player.set_position(max(0.0, min(1.0, pct)))
+            try: self.player.set_position(max(0.0, min(1.0, float(pct))))
             except: pass
 
     def seek_to(self, secs):
@@ -211,189 +176,405 @@ class VLCPlayer:
     def is_ended(self):
         if not self.available: return False
         try:
-            state = self.player.get_state()
-            return str(state) in ("State.Ended","State.NothingSpecial")
+            state = str(self.player.get_state())
+            return "Ended" in state or "NothingSpecial" in state
         except: return False
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  WAVY BACKGROUND CANVAS
+#  THUMBNAIL HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
-class WavyBackground(tk.Canvas):
-    def __init__(self, parent, **kw):
-        super().__init__(parent, bg=BG, highlightthickness=0, **kw)
-        self._phase   = 0.0
+def thumb_path(video_path):
+    key = pathlib.Path(video_path).stem
+    return THUMB_DIR / f"{key}.jpg"
+
+def extract_thumb(video_path):
+    """Extract first frame via ffmpeg if available, else return None."""
+    out = thumb_path(video_path)
+    if out.exists(): return str(out)
+    try:
+        subprocess.run([
+            "ffmpeg", "-y", "-ss", "00:00:05",
+            "-i", video_path,
+            "-vframes", "1",
+            "-vf", f"scale={THUMB_W}:{THUMB_H}:force_original_aspect_ratio=decrease,pad={THUMB_W}:{THUMB_H}:(ow-iw)/2:(oh-ih)/2",
+            str(out)
+        ], capture_output=True, timeout=15)
+        if out.exists(): return str(out)
+    except Exception:
+        pass
+    return None
+
+def tmdb_poster(title, year=None, tmdb_key=""):
+    """Fetch poster URL from TMDB."""
+    if not REQUESTS_OK or not tmdb_key: return None
+    try:
+        params = {"api_key": tmdb_key, "query": title, "language": "en-US"}
+        if year: params["year"] = year
+        r = requests.get("https://api.themoviedb.org/3/search/movie",
+                         params=params, timeout=5)
+        r.raise_for_status()
+        results = r.json().get("results", [])
+        if results:
+            poster = results[0].get("poster_path")
+            if poster:
+                return f"https://image.tmdb.org/t/p/w342{poster}"
+    except: pass
+    return None
+
+def tmdb_tv_poster(title, tmdb_key=""):
+    """Fetch TV show poster from TMDB."""
+    if not REQUESTS_OK or not tmdb_key: return None
+    try:
+        params = {"api_key": tmdb_key, "query": title, "language": "en-US"}
+        r = requests.get("https://api.themoviedb.org/3/search/tv",
+                         params=params, timeout=5)
+        r.raise_for_status()
+        results = r.json().get("results", [])
+        if results:
+            poster = results[0].get("poster_path")
+            if poster:
+                return f"https://image.tmdb.org/t/p/w342{poster}"
+    except: pass
+    return None
+
+def download_image(url, save_path):
+    """Download image from URL to disk."""
+    if not REQUESTS_OK: return False
+    try:
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        with open(save_path, "wb") as f:
+            f.write(r.content)
+        return True
+    except: return False
+
+def make_placeholder(text, w=THUMB_W, h=THUMB_H):
+    """Create a placeholder image with text."""
+    if not PIL_OK: return None
+    img  = Image.new("RGB", (w, h), color=(20, 20, 35))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle([0, 0, w, h], outline=(229, 9, 20), width=2)
+    # Draw text centered
+    lines = [text[i:i+16] for i in range(0, min(len(text), 48), 16)]
+    y = h // 2 - len(lines) * 8
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line)
+        tw = bbox[2] - bbox[0]
+        draw.text(((w - tw) // 2, y), line, fill=(240, 240, 240))
+        y += 18
+    return img
+
+def load_thumb_image(path, w=THUMB_W, h=THUMB_H):
+    """Load image from path and resize, return PhotoImage or None."""
+    if not PIL_OK: return None
+    try:
+        img = Image.open(path).convert("RGB")
+        img = img.resize((w, h), Image.LANCZOS)
+        return ImageTk.PhotoImage(img)
+    except: return None
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  LIBRARY SCANNER
+# ═══════════════════════════════════════════════════════════════════════════════
+def fmt_duration(secs):
+    if not secs: return "0:00"
+    h = int(secs)//3600; m = (int(secs)%3600)//60; s = int(secs)%60
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+def scan_movies(folder):
+    movies = []
+    if not folder or not os.path.isdir(folder): return movies
+    for fname in sorted(os.listdir(folder)):
+        fpath = os.path.join(folder, fname)
+        if os.path.isfile(fpath) and os.path.splitext(fname)[1].lower() in VIDEO_EXT:
+            name, _ = os.path.splitext(fname)
+            m = re.search(r'\((\d{4})\)', name)
+            year  = m.group(1) if m else ""
+            title = re.sub(r'\(\d{4}\)', '', name).strip()
+            movies.append({"title": title, "year": year, "path": fpath})
+    return movies
+
+def scan_series(folder):
+    series = []
+    if not folder or not os.path.isdir(folder): return series
+    for show in sorted(os.listdir(folder)):
+        show_path = os.path.join(folder, show)
+        if not os.path.isdir(show_path): continue
+        seasons = {}
+        for item in sorted(os.listdir(show_path)):
+            item_path = os.path.join(show_path, item)
+            if os.path.isdir(item_path):
+                m = re.match(r'[Ss]eason\s*(\d+)', item)
+                if m:
+                    snum = int(m.group(1))
+                    eps  = []
+                    for ep in sorted(os.listdir(item_path)):
+                        ep_path = os.path.join(item_path, ep)
+                        if os.path.isfile(ep_path) and os.path.splitext(ep)[1].lower() in VIDEO_EXT:
+                            em = re.match(r'(\d)(\d{2})', os.path.splitext(ep)[0])
+                            ep_num = int(em.group(2)) if em else 0
+                            eps.append({"ep": ep_num, "file": ep, "path": ep_path})
+                    if eps: seasons[snum] = eps
+        if seasons:
+            series.append({"show": show, "seasons": seasons, "path": show_path})
+    return series
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SPLASH SCREEN
+# ═══════════════════════════════════════════════════════════════════════════════
+class SplashScreen:
+    def __init__(self, root, on_done):
+        self.root    = root
+        self.on_done = on_done
+        self.alpha   = 0.0
+        self._phase  = 0.0
+        self._prog   = 0.0
         self._img_ref = None
-        self.bind("<Configure>", self._on_resize)
-        self._animate()
 
-    def _on_resize(self, e):
-        self._draw(e.width, e.height)
+        root.overrideredirect(True)
+        root.attributes("-alpha", 0)
+        root.configure(bg=BG)
 
-    def _draw(self, w, h):
-        if w < 10 or h < 10: return
-        if not PIL_OK: return
-        img  = Image.new("RGBA", (w, h), (10, 10, 15, 255))
-        draw = ImageDraw.Draw(img)
-        # Draw several semi-transparent red wavy bands
-        colors = [
-            (229, 9, 20, 18),
-            (255, 45, 58, 12),
-            (180, 5, 15, 22),
-        ]
-        for ci, (r,g,b,a) in enumerate(colors):
-            pts = []
-            amp   = h * (0.04 + ci * 0.025)
-            freq  = 0.008 - ci * 0.002
-            ybase = h * (0.25 + ci * 0.28)
-            steps = max(w // 3, 20)
-            for i in range(steps + 1):
-                x = int(i * w / steps)
-                y = int(ybase + amp * math.sin(freq * x + self._phase + ci * 1.2))
-                pts.append((x, y))
-            # fill below each wave
-            poly = pts + [(w, h), (0, h)]
-            draw.polygon(poly, fill=(r, g, b, a))
-        # subtle vignette
-        for edge in range(0, min(w,h)//4, 8):
-            alpha = int(60 * (1 - edge / (min(w,h)//4)))
-            draw.rectangle([edge, edge, w-edge, h-edge],
-                           outline=(10,10,15,alpha), width=8)
-        photo = ImageTk.PhotoImage(img)
-        self._img_ref = photo
-        self.delete("bg")
-        self.create_image(0, 0, image=photo, anchor="nw", tags="bg")
-        self.tag_lower("bg")
+        sw = root.winfo_screenwidth()
+        sh = root.winfo_screenheight()
+        w, h = 700, 400
+        root.geometry(f"{w}x{h}+{(sw-w)//2}+{(sh-h)//2}")
 
-    def _animate(self):
-        self._phase += 0.015
-        w = self.winfo_width(); h = self.winfo_height()
-        if w > 10 and h > 10: self._draw(w, h)
-        self.after(50, self._animate)
+        self.canvas = tk.Canvas(root, width=w, height=h,
+                                bg=BG, highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  TITLE CARD WIDGET
-# ═══════════════════════════════════════════════════════════════════════════════
-class TitleCard(tk.Frame):
-    def __init__(self, parent, title, subtitle, progress, status,
-                 on_play, on_right_click, **kw):
-        super().__init__(parent, bg=CARD, cursor="hand2",
-                         relief="flat", bd=0, **kw)
-        self.on_play        = on_play
-        self.on_right_click = on_right_click
-        self._build(title, subtitle, progress, status)
-        self.bind("<Button-1>",        lambda e: on_play())
-        self.bind("<Button-3>",        on_right_click)
-        self.bind("<Enter>",           self._hover_on)
-        self.bind("<Leave>",           self._hover_off)
-        for child in self.winfo_children():
-            child.bind("<Button-1>",   lambda e: on_play())
-            child.bind("<Button-3>",   on_right_click)
-            child.bind("<Enter>",      self._hover_on)
-            child.bind("<Leave>",      self._hover_off)
+        self._w = w; self._h = h
+        self._draw_frame()
+        self._fade_in()
 
-    def _build(self, title, subtitle, progress, status):
-        # Colour band at top
-        band = tk.Frame(self, bg=ACCENT, height=3)
-        band.pack(fill="x")
+    def _draw_frame(self):
+        w, h = self._w, self._h
+        self.canvas.delete("all")
 
-        body = tk.Frame(self, bg=CARD, padx=10, pady=8)
-        body.pack(fill="both", expand=True)
+        if PIL_OK:
+            img  = Image.new("RGBA", (w, h), (10, 10, 15, 255))
+            draw = ImageDraw.Draw(img)
+            colors = [(229,9,20,25),(255,45,58,15),(180,5,15,30)]
+            for ci, (r,g,b,a) in enumerate(colors):
+                pts   = []
+                amp   = h * (0.06 + ci * 0.03)
+                freq  = 0.007 - ci * 0.002
+                ybase = h * (0.3 + ci * 0.25)
+                for i in range(w // 2 + 1):
+                    x = int(i * w / (w // 2))
+                    y = int(ybase + amp * math.sin(freq * x + self._phase + ci * 1.2))
+                    pts.append((x, y))
+                poly = pts + [(w, h), (0, h)]
+                draw.polygon(poly, fill=(r, g, b, a))
+            photo = ImageTk.PhotoImage(img)
+            self._img_ref = photo
+            self.canvas.create_image(0, 0, image=photo, anchor="nw")
 
-        # Status badge
-        if status == "watched":
-            badge_bg, badge_fg, badge_txt = "#1a3a1a", GREEN, "✓ Watched"
-        elif status == "watching":
-            badge_bg, badge_fg, badge_txt = "#3a1a1a", ACCENT2, "▶ Watching"
+        # Title
+        self.canvas.create_text(w//2, h//2 - 60,
+            text="CINEVAULT",
+            font=("Georgia", 48, "bold"),
+            fill=ACCENT,
+            stipple="" )
+
+        # Subtitle
+        sub_alpha = max(0, min(255, int((self._prog - 0.3) / 0.3 * 255)))
+        if sub_alpha > 0:
+            self.canvas.create_text(w//2, h//2 + 10,
+                text="your media, your way",
+                font=("Segoe UI", 14),
+                fill=f"#{sub_alpha:02x}{sub_alpha:02x}{sub_alpha:02x}")
+
+        # Loading bar background
+        bar_y = h - 40
+        self.canvas.create_rectangle(60, bar_y, w-60, bar_y+4,
+                                     fill="#1a1a2e", outline="")
+        # Loading bar fill
+        bar_w = int((w - 120) * min(self._prog, 1.0))
+        if bar_w > 0:
+            self.canvas.create_rectangle(60, bar_y, 60+bar_w, bar_y+4,
+                                         fill=ACCENT, outline="")
+
+        # Version text
+        self.canvas.create_text(w//2, h - 16,
+            text="Loading...", font=("Segoe UI", 8), fill=MUTED)
+
+    def _fade_in(self):
+        self.alpha = min(1.0, self.alpha + 0.05)
+        self.root.attributes("-alpha", self.alpha)
+        self._phase += 0.04
+        self._prog  += 0.012
+        self._draw_frame()
+        if self.alpha < 1.0 or self._prog < 1.0:
+            self.root.after(30, self._fade_in)
         else:
-            badge_bg, badge_fg, badge_txt = PROG_BG, MUTED, "● Unwatched"
+            self.root.after(400, self._fade_out)
 
-        tk.Label(body, text=badge_txt, font=("Segoe UI", 7, "bold"),
-                 bg=badge_bg, fg=badge_fg, padx=4, pady=1).pack(anchor="ne")
+    def _fade_out(self):
+        self.alpha = max(0.0, self.alpha - 0.06)
+        self.root.attributes("-alpha", self.alpha)
+        if self.alpha > 0:
+            self.root.after(25, self._fade_out)
+        else:
+            self.root.destroy()
+            self.on_done()
 
-        tk.Label(body, text=title, font=F_CARD, bg=CARD, fg=TEXT,
-                 wraplength=160, justify="left").pack(anchor="w", pady=(4,0))
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SCROLL FRAME
+# ═══════════════════════════════════════════════════════════════════════════════
+class ScrollFrame(tk.Frame):
+    def __init__(self, parent, **kw):
+        kw.setdefault("bg", BG)
+        super().__init__(parent, **kw)
+        self.canvas = tk.Canvas(self, bg=BG, highlightthickness=0)
+        sb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.inner = tk.Frame(self.canvas, bg=BG)
+        self.inner.bind("<Configure>",
+            lambda e: self.canvas.configure(
+                scrollregion=self.canvas.bbox("all")))
+        self._win = self.canvas.create_window((0,0), window=self.inner, anchor="nw")
+        self.canvas.configure(yscrollcommand=sb.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.canvas.bind("<Configure>",
+            lambda e: self.canvas.itemconfig(self._win, width=e.width))
+        self.canvas.bind("<MouseWheel>",
+            lambda e: self.canvas.yview_scroll(-1*(e.delta//120), "units"))
+        self.inner.bind("<MouseWheel>",
+            lambda e: self.canvas.yview_scroll(-1*(e.delta//120), "units"))
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MEDIA CARD WIDGET
+# ═══════════════════════════════════════════════════════════════════════════════
+class MediaCard(tk.Frame):
+    def __init__(self, parent, title, subtitle, thumb_path_str,
+                 progress, status, on_click, on_right_click=None, **kw):
+        super().__init__(parent, bg=CARD, cursor="hand2",
+                         width=CARD_W, height=CARD_H+50, **kw)
+        self.pack_propagate(False)
+        self._photo   = None
+        self._on_click = on_click
+
+        # Thumbnail area
+        self.thumb_frame = tk.Label(self, bg="#1a1a2e",
+                                    width=CARD_W, height=THUMB_H)
+        self.thumb_frame.pack(fill="x")
+
+        # Load thumbnail
+        if thumb_path_str and os.path.isfile(thumb_path_str):
+            photo = load_thumb_image(thumb_path_str)
+            if photo:
+                self._photo = photo
+                self.thumb_frame.configure(image=photo)
+        else:
+            # Placeholder
+            if PIL_OK:
+                ph    = make_placeholder(title)
+                photo = ImageTk.PhotoImage(ph)
+                self._photo = photo
+                self.thumb_frame.configure(image=photo)
+            else:
+                self.thumb_frame.configure(text=title[:20], fg=TEXT2,
+                                           font=F_SMALL)
+
+        # Progress bar under thumb
+        pb = tk.Frame(self, bg=PROG_BG, height=3)
+        pb.pack(fill="x")
+        pb.pack_propagate(False)
+        if progress > 0:
+            col = GREEN if progress >= WATCHED_MARK else ACCENT
+            tk.Frame(pb, bg=col, height=3).place(
+                relx=0, rely=0, relwidth=min(progress, 1.0), relheight=1)
+
+        # Info area
+        info = tk.Frame(self, bg=CARD, pady=4)
+        info.pack(fill="x", padx=6)
+
+        # Status dot
+        if status == "watched":
+            dot, dot_col = "✓", GREEN
+        elif status == "watching":
+            dot, dot_col = "▶", ACCENT2
+        else:
+            dot, dot_col = "●", MUTED
+
+        top_row = tk.Frame(info, bg=CARD)
+        top_row.pack(fill="x")
+        tk.Label(top_row, text=dot, font=("Segoe UI",7),
+                 bg=CARD, fg=dot_col).pack(side="left")
+        tk.Label(top_row, text=title[:22], font=F_CARD,
+                 bg=CARD, fg=TEXT, anchor="w").pack(side="left", padx=2)
 
         if subtitle:
-            tk.Label(body, text=subtitle, font=F_SMALL, bg=CARD,
-                     fg=TEXT2).pack(anchor="w")
+            tk.Label(info, text=subtitle, font=F_SMALL,
+                     bg=CARD, fg=TEXT2, anchor="w").pack(fill="x")
 
-        # Progress bar
-        pb_frame = tk.Frame(body, bg=PROG_BG, height=3)
-        pb_frame.pack(fill="x", pady=(6,0))
-        pb_frame.pack_propagate(False)
-        if progress > 0:
-            fill_w = int(progress * 160)
-            col    = GREEN if progress >= WATCHED_MARK else ACCENT
-            tk.Frame(pb_frame, bg=col, height=3,
-                     width=fill_w).place(x=0, y=0, relheight=1)
-
-        if progress > 0:
-            tk.Label(body, text=f"{int(progress*100)}%", font=F_MONO,
-                     bg=CARD, fg=MUTED).pack(anchor="e")
+        # Bind clicks
+        for w in [self, self.thumb_frame, info] + list(info.winfo_children()) + list(top_row.winfo_children()):
+            try:
+                w.bind("<Button-1>", lambda e: on_click())
+                if on_right_click:
+                    w.bind("<Button-3>", on_right_click)
+                w.bind("<Enter>", self._hover_on)
+                w.bind("<Leave>", self._hover_off)
+            except: pass
 
     def _hover_on(self, e=None):
-        self.configure(bg=CARD_H)
-        for c in self.winfo_children(): _set_bg_recursive(c, CARD_H)
-
+        self.configure(bg=CARD_H_C)
     def _hover_off(self, e=None):
         self.configure(bg=CARD)
-        for c in self.winfo_children(): _set_bg_recursive(c, CARD)
-
-def _set_bg_recursive(w, color):
-    try: w.configure(bg=color)
-    except: pass
-    for c in w.winfo_children():
-        _set_bg_recursive(c, color)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  MAIN APPLICATION
 # ═══════════════════════════════════════════════════════════════════════════════
 class CineVault:
     def __init__(self, root):
-        self.root        = root
-        self.cfg         = load_cfg()
-        self.db          = load_db()
-        self.vlc         = None
-        self.current     = None   # {path, title, type, start_time, duration}
-        self.mini_mode   = False
-        self._poll_id    = None
-        self._seek_drag  = False
+        self.root         = root
+        self.cfg          = load_cfg()
+        self.db           = load_db()
+        self.vlc          = VLCPlayer()
+        self.current      = None
+        self.mini_mode    = False
+        self._poll_id     = None
+        self._seek_drag   = False
+        self._cur_series  = None   # currently viewed series
+        self._cur_season  = None   # currently viewed season
+        self._view_stack  = []     # navigation stack
 
         root.title("CineVault")
-        geo = self.cfg.get("geometry","1280x780")
+        geo = self.cfg.get("geometry", "1300x800")
         root.geometry(geo)
         root.configure(bg=BG)
-        root.minsize(900, 600)
+        root.minsize(960, 640)
         root.bind("<Configure>", self._on_resize)
         root.bind("<KeyPress>",  self._on_key)
 
-        self._build_ui()
-        self._init_vlc()
-        self.root.after(500, self._refresh_library)
+        # Try loading VLC from saved path
+        vlc_path = self.cfg.get("vlc_path", "")
+        if vlc_path:
+            ok, msg = self.vlc.load(vlc_path)
+            if not ok:
+                self.cfg["vlc_status"] = f"⚠ VLC error: {msg}"
 
-    # ── VLC init ──────────────────────────────────────────────────────────────
-    def _init_vlc(self):
-        path = self.cfg.get("vlc_path","")
-        if path and os.path.isfile(path):
-            self.vlc = VLCPlayer(path)
-            if not self.vlc.available:
-                self.vlc = None
+        self._build_ui()
+        self.root.after(600, self._refresh_library)
 
     # ══════════════════════════════════════════════════════════════════════════
     #  UI BUILD
     # ══════════════════════════════════════════════════════════════════════════
     def _build_ui(self):
-        # ── Sidebar ──
-        self.sidebar = tk.Frame(self.root, bg="#08080f", width=180)
+        # Sidebar
+        self.sidebar = tk.Frame(self.root, bg=SIDEBAR, width=190)
         self.sidebar.pack(side="left", fill="y")
         self.sidebar.pack_propagate(False)
         self._build_sidebar()
 
-        # ── Main area ──
+        # Main content
         self.main = tk.Frame(self.root, bg=BG)
         self.main.pack(side="left", fill="both", expand=True)
 
-        # ── Pages ──
+        # Pages dict
         self.pages = {}
         for name in ("home","movies","series","history","settings"):
             f = tk.Frame(self.main, bg=BG)
@@ -405,10 +586,6 @@ class CineVault:
         self._build_history_page()
         self._build_settings_page()
 
-        # ── Player area (hidden until playing) ──
-        self.player_area = tk.Frame(self.root, bg="#000", width=0)
-        # built lazily
-
         self._current_page = None
         self._show_page("home")
 
@@ -416,195 +593,249 @@ class CineVault:
     def _build_sidebar(self):
         sb = self.sidebar
         # Logo
-        logo = tk.Frame(sb, bg="#08080f", pady=18)
+        logo = tk.Frame(sb, bg=SIDEBAR, pady=20)
         logo.pack(fill="x")
-        tk.Label(logo, text="CINEVAULT", font=("Georgia",20,"bold"),
-                 bg="#08080f", fg=ACCENT).pack()
+        tk.Label(logo, text="CINEVAULT",
+                 font=("Georgia", 18, "bold"),
+                 bg=SIDEBAR, fg=ACCENT).pack()
         tk.Label(logo, text="your media, your way",
-                 font=("Segoe UI",8), bg="#08080f", fg=MUTED).pack()
-        tk.Frame(sb, bg=ACCENT, height=1).pack(fill="x", padx=20)
+                 font=("Segoe UI", 7), bg=SIDEBAR, fg=MUTED).pack()
+        tk.Frame(sb, bg=ACCENT, height=1).pack(fill="x", padx=16)
 
-        nav_items = [
-            ("🏠  Home",      "home"),
-            ("🎬  Movies",    "movies"),
-            ("📺  Series",    "series"),
-            ("📋  History",   "history"),
-            ("⚙   Settings",  "settings"),
-        ]
+        nav = [("🏠  Home","home"),("🎬  Movies","movies"),
+               ("📺  Series","series"),("📋  History","history"),
+               ("⚙   Settings","settings")]
         self.nav_btns = {}
-        for label, page in nav_items:
+        for label, page in nav:
             btn = tk.Button(sb, text=label, font=F_UI_B,
-                            bg="#08080f", fg=TEXT2, relief="flat",
-                            anchor="w", padx=20, pady=10,
-                            cursor="hand2",
+                            bg=SIDEBAR, fg=TEXT2, relief="flat",
+                            anchor="w", padx=20, pady=10, cursor="hand2",
                             activebackground=CARD, activeforeground=TEXT,
                             command=lambda p=page: self._show_page(p))
             btn.pack(fill="x")
             self.nav_btns[page] = btn
 
-        # Now playing indicator at bottom of sidebar
-        tk.Frame(sb, bg=ACCENT, height=1).pack(fill="x", padx=20, side="bottom", pady=(0,4))
+        tk.Frame(sb, bg=ACCENT, height=1).pack(fill="x", padx=16, side="bottom", pady=(0,4))
         self.now_playing_lbl = tk.Label(sb, text="", font=("Segoe UI",7),
-                                         bg="#08080f", fg=MUTED,
-                                         wraplength=160, justify="left")
-        self.now_playing_lbl.pack(side="bottom", fill="x", padx=10, pady=4)
+                                         bg=SIDEBAR, fg=MUTED,
+                                         wraplength=170, justify="left")
+        self.now_playing_lbl.pack(side="bottom", fill="x", padx=8, pady=4)
 
-    # ── Pages ─────────────────────────────────────────────────────────────────
+    # ── Page builder helpers ──────────────────────────────────────────────────
+    def _show_page(self, name):
+        if self._current_page:
+            self._current_page.pack_forget()
+        self.pages[name].pack(fill="both", expand=True)
+        self._current_page = self.pages[name]
+        for n, btn in self.nav_btns.items():
+            btn.configure(bg=CARD if n==name else SIDEBAR,
+                          fg=TEXT if n==name else TEXT2)
+        # Reset series drill-down when leaving series page
+        if name != "series":
+            self._cur_series = None
+            self._cur_season = None
+
+    # ── Home ──────────────────────────────────────────────────────────────────
     def _build_home(self):
         p = self.pages["home"]
-        # WavyBackground disabled — caused click-blocking on Windows
-
-        scroll = _ScrollFrame(p)
-        scroll.pack(fill="both", expand=True)
-        inner = scroll.inner
+        sf = ScrollFrame(p); sf.pack(fill="both", expand=True)
+        inner = sf.inner
 
         tk.Label(inner, text="Continue Watching", font=F_HEAD,
                  bg=BG, fg=TEXT, pady=12).pack(anchor="w", padx=20)
-        self.continue_frame = tk.Frame(inner, bg=BG)
-        self.continue_frame.pack(fill="x", padx=20, pady=(0,16))
+        self.continue_row = tk.Frame(inner, bg=BG)
+        self.continue_row.pack(fill="x", padx=20, pady=(0,20))
 
         tk.Label(inner, text="Recently Added", font=F_HEAD,
                  bg=BG, fg=TEXT, pady=8).pack(anchor="w", padx=20)
-        self.recent_frame = tk.Frame(inner, bg=BG)
-        self.recent_frame.pack(fill="x", padx=20)
+        self.recent_row = tk.Frame(inner, bg=BG)
+        self.recent_row.pack(fill="x", padx=20)
 
+    # ── Movies page ───────────────────────────────────────────────────────────
     def _build_movies_page(self):
         p = self.pages["movies"]
-        # WavyBackground disabled — caused click-blocking on Windows
-        self._build_library_page(p, "movies")
+        # Toolbar
+        bar = tk.Frame(p, bg=BG2, pady=8); bar.pack(fill="x")
+        tk.Label(bar, text="🎬  Movies", font=F_HEAD,
+                 bg=BG2, fg=TEXT).pack(side="left", padx=16)
 
+        self.mov_search = tk.StringVar()
+        tk.Entry(bar, textvariable=self.mov_search, bg=CARD, fg=TEXT,
+                 relief="flat", font=F_UI, insertbackground=TEXT,
+                 width=20).pack(side="left", padx=8, ipady=4)
+        self.mov_search.trace_add("write", lambda *_: self._populate_movies())
+
+        self.mov_sort = tk.StringVar(value="Name")
+        ttk.Combobox(bar, textvariable=self.mov_sort, width=16,
+                     values=["Name","Recently Added","Last Watched"],
+                     state="readonly", font=F_UI).pack(side="left", padx=4)
+        self.mov_sort.trace_add("write", lambda *_: self._populate_movies())
+
+        self.mov_filter = tk.StringVar(value="All")
+        ttk.Combobox(bar, textvariable=self.mov_filter, width=12,
+                     values=["All","Unwatched","Watching","Watched"],
+                     state="readonly", font=F_UI).pack(side="left", padx=4)
+        self.mov_filter.trace_add("write", lambda *_: self._populate_movies())
+
+        tk.Button(bar, text="🌐 TMDB Refresh",
+                  command=self._tmdb_refresh_movies,
+                  bg=CARD, fg=TEXT2, relief="flat", font=F_UI,
+                  cursor="hand2", padx=8).pack(side="right", padx=4)
+        tk.Button(bar, text="⟳ Refresh",
+                  command=self._refresh_library,
+                  bg=CARD, fg=TEXT2, relief="flat", font=F_UI,
+                  cursor="hand2", padx=8).pack(side="right", padx=4)
+
+        # Library scroll
+        tk.Label(p, text="▸  Library", font=F_UI_B,
+                 bg=BG, fg=TEXT2).pack(anchor="w", padx=16, pady=(8,2))
+        self.mov_scroll = ScrollFrame(p)
+        self.mov_scroll.pack(fill="both", expand=True)
+
+        # Watched section
+        tk.Label(p, text="✓  Watched", font=F_UI_B,
+                 bg=BG, fg=GREEN).pack(anchor="w", padx=16, pady=(6,2))
+        self.mov_watched_scroll = ScrollFrame(p, height=220)
+        self.mov_watched_scroll.pack(fill="x")
+
+    # ── Series page (drill-down) ───────────────────────────────────────────────
     def _build_series_page(self):
         p = self.pages["series"]
-        # WavyBackground disabled — caused click-blocking on Windows
-        self._build_library_page(p, "series")
+        # Top bar (changes based on view level)
+        self.series_bar = tk.Frame(p, bg=BG2, pady=8)
+        self.series_bar.pack(fill="x")
+        self._build_series_toolbar()
 
-    def _build_library_page(self, parent, kind):
-        top = tk.Frame(parent, bg=BG)
-        top.pack(fill="both", expand=True)
+        # Content area — swapped out per drill-down level
+        self.series_content = tk.Frame(p, bg=BG)
+        self.series_content.pack(fill="both", expand=True)
 
-        # toolbar
-        bar = tk.Frame(top, bg=BG2, pady=8)
-        bar.pack(fill="x", padx=0)
+    def _build_series_toolbar(self, back=False, title="📺  Series"):
+        for w in self.series_bar.winfo_children(): w.destroy()
 
-        tk.Label(bar, text=("🎬 Movies" if kind=="movies" else "📺 Series"),
-                 font=F_HEAD, bg=BG2, fg=TEXT).pack(side="left", padx=16)
+        if back:
+            tk.Button(self.series_bar, text="◀  Back",
+                      command=self._series_go_back,
+                      bg=CARD, fg=TEXT2, relief="flat", font=F_UI_B,
+                      cursor="hand2", padx=10).pack(side="left", padx=8)
 
-        # search
-        sv = tk.StringVar()
-        setattr(self, f"{kind}_search", sv)
-        se = tk.Entry(bar, textvariable=sv, bg=CARD, fg=TEXT, relief="flat",
-                      font=F_UI, insertbackground=TEXT, width=22)
-        se.pack(side="left", padx=8, ipady=4)
-        tk.Label(bar, text="🔍", bg=BG2, fg=MUTED).pack(side="left")
-        sv.trace_add("write", lambda *_: self._filter_library(kind))
+        tk.Label(self.series_bar, text=title, font=F_HEAD,
+                 bg=BG2, fg=TEXT).pack(side="left", padx=8)
 
-        # sort
-        sort_var = tk.StringVar(value="Name")
-        setattr(self, f"{kind}_sort", sort_var)
-        sort_cb = ttk.Combobox(bar, textvariable=sort_var, width=16,
-                               values=["Name","Recently Added","Last Watched"],
-                               state="readonly", font=F_UI)
-        sort_cb.pack(side="left", padx=8)
-        sort_cb.bind("<<ComboboxSelected>>", lambda *_: self._filter_library(kind))
+        if not back:
+            self.ser_search = tk.StringVar()
+            tk.Entry(self.series_bar, textvariable=self.ser_search,
+                     bg=CARD, fg=TEXT, relief="flat", font=F_UI,
+                     insertbackground=TEXT, width=20).pack(side="left", padx=8, ipady=4)
+            self.ser_search.trace_add("write", lambda *_: self._populate_series_list())
 
-        # filter
-        filt_var = tk.StringVar(value="All")
-        setattr(self, f"{kind}_filter", filt_var)
-        filt_cb = ttk.Combobox(bar, textvariable=filt_var, width=12,
-                               values=["All","Unwatched","Watching","Watched"],
-                               state="readonly", font=F_UI)
-        filt_cb.pack(side="left", padx=4)
-        filt_cb.bind("<<ComboboxSelected>>", lambda *_: self._filter_library(kind))
+            self.ser_sort = tk.StringVar(value="Name")
+            ttk.Combobox(self.series_bar, textvariable=self.ser_sort, width=14,
+                         values=["Name","Recently Added","Last Watched"],
+                         state="readonly", font=F_UI).pack(side="left", padx=4)
+            self.ser_sort.trace_add("write", lambda *_: self._populate_series_list())
 
-        tk.Button(bar, text="⟳ Refresh", command=self._refresh_library,
-                  bg=CARD, fg=TEXT2, relief="flat", font=F_UI,
-                  cursor="hand2", padx=8).pack(side="right", padx=12)
+            tk.Button(self.series_bar, text="🌐 TMDB Refresh",
+                      command=self._tmdb_refresh_series,
+                      bg=CARD, fg=TEXT2, relief="flat", font=F_UI,
+                      cursor="hand2", padx=8).pack(side="right", padx=4)
+            tk.Button(self.series_bar, text="⟳ Refresh",
+                      command=self._refresh_library,
+                      bg=CARD, fg=TEXT2, relief="flat", font=F_UI,
+                      cursor="hand2", padx=8).pack(side="right", padx=4)
 
-        # watched section label
-        tk.Label(top, text="▸  Library", font=F_UI_B,
-                 bg=BG, fg=TEXT2).pack(anchor="w", padx=16, pady=(10,2))
+    def _clear_series_content(self):
+        for w in self.series_content.winfo_children(): w.destroy()
 
-        scroll = _ScrollFrame(top)
-        scroll.pack(fill="both", expand=True)
-        setattr(self, f"{kind}_scroll", scroll)
-        setattr(self, f"{kind}_inner",  scroll.inner)
+    def _series_go_back(self):
+        if self._cur_season is not None:
+            # Go back to season list
+            self._cur_season = None
+            self._show_series_seasons(self._cur_series)
+        elif self._cur_series is not None:
+            # Go back to series list
+            self._cur_series = None
+            self._build_series_toolbar(back=False)
+            self._populate_series_list()
 
-        # watched section
-        tk.Label(top, text="✓  Watched", font=F_UI_B,
-                 bg=BG, fg=GREEN).pack(anchor="w", padx=16, pady=(10,2))
-        ws = _ScrollFrame(top, height=180)
-        ws.pack(fill="x", padx=0)
-        setattr(self, f"{kind}_watched_scroll", ws)
-        setattr(self, f"{kind}_watched_inner",  ws.inner)
-
+    # ── History ───────────────────────────────────────────────────────────────
     def _build_history_page(self):
         p = self.pages["history"]
-        # WavyBackground disabled — caused click-blocking on Windows
-        overlay = tk.Frame(p, bg=BG)
-        overlay.pack(fill="both", expand=True)
-
-        tk.Label(overlay, text="Watch History", font=F_HEAD,
+        tk.Label(p, text="Watch History", font=F_HEAD,
                  bg=BG, fg=TEXT, pady=16).pack(anchor="w", padx=20)
-        tk.Button(overlay, text="Clear History",
+        tk.Button(p, text="Clear History",
                   command=self._clear_history,
                   bg=CARD, fg=ACCENT, relief="flat", font=F_UI,
                   cursor="hand2", padx=10).pack(anchor="e", padx=20)
 
         cols = ("Title","Type","Date","Duration","Status")
         style = ttk.Style()
-        style.configure("Hist.Treeview", background=CARD, fieldbackground=CARD,
-                        foreground=TEXT, rowheight=24, font=F_UI)
-        style.configure("Hist.Treeview.Heading", background=CARD_H,
-                        foreground=TEXT2, font=F_UI_B)
-        self.hist_tree = ttk.Treeview(overlay, columns=cols, show="headings",
+        style.configure("Hist.Treeview", background=CARD,
+                        fieldbackground=CARD, foreground=TEXT,
+                        rowheight=24, font=F_UI)
+        style.configure("Hist.Treeview.Heading",
+                        background=CARD_H_C, foreground=TEXT2, font=F_UI_B)
+        self.hist_tree = ttk.Treeview(p, columns=cols, show="headings",
                                        style="Hist.Treeview", height=20)
         for c in cols:
             self.hist_tree.heading(c, text=c)
             self.hist_tree.column(c, width=160 if c=="Title" else 100)
-        sb2 = ttk.Scrollbar(overlay, orient="vertical",
-                             command=self.hist_tree.yview)
+        sb2 = ttk.Scrollbar(p, orient="vertical", command=self.hist_tree.yview)
         self.hist_tree.configure(yscrollcommand=sb2.set)
         self.hist_tree.pack(side="left", fill="both", expand=True, padx=(20,0), pady=8)
         sb2.pack(side="left", fill="y", pady=8)
 
+    # ── Settings ──────────────────────────────────────────────────────────────
     def _build_settings_page(self):
         p = self.pages["settings"]
-        # WavyBackground disabled — caused click-blocking on Windows
-        overlay = tk.Frame(p, bg=BG)
-        overlay.pack(fill="both", expand=True)
-
-        tk.Label(overlay, text="⚙  Settings", font=F_HEAD,
+        tk.Label(p, text="⚙  Settings", font=F_HEAD,
                  bg=BG, fg=TEXT, pady=16).pack(anchor="w", padx=20)
 
         rows = [
-            ("VLC Path",       "vlc_path",    "Path to libvlc.dll or vlc executable"),
-            ("Movies Folder",  "movies_dir",  "Your organised movies output folder"),
-            ("Series Folder",  "series_dir",  "Your organised series output folder"),
+            ("VLC Path",      "vlc_path",   "Point to vlc.exe in your VLC install folder"),
+            ("Movies Folder", "movies_dir", "Your organised movies output folder"),
+            ("Series Folder", "series_dir", "Your organised series output folder"),
+            ("TMDB API Key",  "tmdb_key",   "Free key from themoviedb.org (optional)"),
         ]
-        self._setting_vars = {}
+        self._svars = {}
         for label, key, hint in rows:
-            row = tk.Frame(overlay, bg=BG); row.pack(fill="x", padx=20, pady=6)
+            row = tk.Frame(p, bg=BG); row.pack(fill="x", padx=20, pady=6)
             tk.Label(row, text=label, font=F_UI_B, bg=BG, fg=TEXT,
                      width=16, anchor="w").pack(side="left")
             var = tk.StringVar(value=self.cfg.get(key,""))
-            self._setting_vars[key] = var
+            self._svars[key] = var
             tk.Entry(row, textvariable=var, bg=CARD, fg=TEXT, relief="flat",
                      font=F_UI, insertbackground=TEXT,
-                     width=46).pack(side="left", ipady=4, padx=(0,8))
+                     width=44).pack(side="left", ipady=4, padx=(0,8))
             tk.Button(row, text="Browse",
                       command=lambda k=key, v=var: self._browse_setting(k,v),
                       bg=ACCENT, fg="white", relief="flat", font=F_UI,
                       cursor="hand2", padx=8).pack(side="left")
-            tk.Label(row, text=hint, font=F_SMALL, bg=BG,
-                     fg=MUTED).pack(anchor="w", padx=(140,0))
+            tk.Label(p, text=hint, font=F_SMALL,
+                     bg=BG, fg=MUTED).pack(anchor="w", padx=(162,0))
 
-        tk.Button(overlay, text="💾  Save Settings", command=self._save_settings,
+        # VLC status label
+        self.vlc_status_lbl = tk.Label(p, text=self._vlc_status_text(),
+                                        font=F_UI, bg=BG,
+                                        fg=GREEN if self.vlc.available else ACCENT)
+        self.vlc_status_lbl.pack(anchor="w", padx=20, pady=(4,0))
+
+        tk.Button(p, text="💾  Save Settings",
+                  command=self._save_settings,
                   bg=ACCENT, fg="white", relief="flat",
                   font=("Segoe UI Semibold",10), cursor="hand2",
                   padx=16, pady=8).pack(padx=20, pady=16, anchor="w")
 
+    def _vlc_status_text(self):
+        if self.vlc.available:
+            return "✅  VLC loaded successfully"
+        path = self.cfg.get("vlc_path","")
+        if not path:
+            return "⚠  VLC path not set — go to Settings"
+        return self.cfg.get("vlc_status", "⚠  VLC not loaded — check path")
+
     # ══════════════════════════════════════════════════════════════════════════
-    #  PLAYER PANEL  (built once, shown/hidden)
+    #  PLAYER PANEL
     # ══════════════════════════════════════════════════════════════════════════
     def _ensure_player_panel(self):
         if hasattr(self, "_player_built"): return
@@ -614,169 +845,127 @@ class CineVault:
         self.player_panel.pack(side="right", fill="both", expand=True)
         self.player_panel.pack_forget()
 
-        # video canvas
         self.video_canvas = tk.Canvas(self.player_panel, bg="#000",
                                        highlightthickness=0, cursor="hand2")
         self.video_canvas.pack(fill="both", expand=True)
         self.video_canvas.bind("<Double-Button-1>", self._toggle_mini)
         self.video_canvas.bind("<Button-1>",        lambda e: self._toggle_pause())
 
-        # controls bar
         ctrl = tk.Frame(self.player_panel, bg="#0d0d0d", pady=6)
         ctrl.pack(fill="x", side="bottom")
 
-        # seek bar
         self.seek_var = tk.DoubleVar()
-        self.seek_bar = ttk.Scale(ctrl, from_=0, to=1, variable=self.seek_var,
-                                   orient="horizontal", command=self._on_seek_move)
-        self.seek_bar.pack(fill="x", padx=10, pady=(0,4))
-        self.seek_bar.bind("<ButtonPress-1>",   lambda e: setattr(self,"_seek_drag",True))
-        self.seek_bar.bind("<ButtonRelease-1>", self._on_seek_release)
+        seek = ttk.Scale(ctrl, from_=0, to=1, variable=self.seek_var,
+                         orient="horizontal", command=self._on_seek_move)
+        seek.pack(fill="x", padx=10, pady=(0,4))
+        seek.bind("<ButtonPress-1>",   lambda e: setattr(self,"_seek_drag",True))
+        seek.bind("<ButtonRelease-1>", self._on_seek_release)
 
-        # buttons row
-        btn_row = tk.Frame(ctrl, bg="#0d0d0d")
-        btn_row.pack(fill="x", padx=10)
-
+        btn_row = tk.Frame(ctrl, bg="#0d0d0d"); btn_row.pack(fill="x", padx=10)
         self.play_btn = tk.Button(btn_row, text="⏸", font=("Segoe UI",14),
                                    bg="#0d0d0d", fg=TEXT, relief="flat",
                                    cursor="hand2", command=self._toggle_pause)
         self.play_btn.pack(side="left")
-
         tk.Button(btn_row, text="⏹", font=("Segoe UI",12),
                   bg="#0d0d0d", fg=TEXT2, relief="flat",
                   cursor="hand2", command=self._stop_playback).pack(side="left",padx=4)
-
         self.time_lbl = tk.Label(btn_row, text="0:00 / 0:00",
                                   font=F_MONO, bg="#0d0d0d", fg=TEXT2)
         self.time_lbl.pack(side="left", padx=10)
-
-        # volume
-        tk.Label(btn_row, text="🔊", bg="#0d0d0d", fg=TEXT2).pack(side="right")
-        self.vol_var = tk.IntVar(value=80)
-        vol_sl = ttk.Scale(btn_row, from_=0, to=100, variable=self.vol_var,
-                           orient="horizontal", length=80,
-                           command=lambda v: self.vlc and self.vlc.set_volume(int(float(v))))
-        vol_sl.pack(side="right", padx=4)
-
         self.now_lbl = tk.Label(btn_row, text="", font=F_UI,
                                  bg="#0d0d0d", fg=MUTED)
         self.now_lbl.pack(side="right", padx=10)
+        tk.Label(btn_row, text="🔊", bg="#0d0d0d", fg=TEXT2).pack(side="right")
+        self.vol_var = tk.IntVar(value=80)
+        ttk.Scale(btn_row, from_=0, to=100, variable=self.vol_var,
+                  orient="horizontal", length=80,
+                  command=lambda v: self.vlc.set_volume(int(float(v)))
+                  ).pack(side="right", padx=4)
 
-        # Mini player side list
-        self.mini_list_frame = tk.Frame(self.player_panel, bg=BG2, width=260)
-        self.mini_list_frame.pack_forget()
+        self.mini_list = tk.Frame(self.player_panel, bg=BG2, width=270)
+        self.mini_list.pack_forget()
 
     # ══════════════════════════════════════════════════════════════════════════
     #  PLAYBACK
     # ══════════════════════════════════════════════════════════════════════════
     def _play(self, path, title, media_type, resume=True):
-        if not self.vlc or not self.vlc.available:
-            messagebox.showwarning("VLC not configured",
-                "Please set the VLC path in Settings first.")
+        if not self.vlc.available:
+            messagebox.showwarning("VLC not loaded",
+                "Please set the VLC path in Settings and save.")
+            self._show_page("settings")
             return
-
         self._ensure_player_panel()
         self.player_panel.pack(side="right", fill="both", expand=True)
-
-        # set window handle
         self.root.update()
-        hwnd = self.video_canvas.winfo_id()
-        self.vlc.set_window(hwnd)
+        self.vlc.set_window(self.video_canvas.winfo_id())
 
-        # resume position
+        key   = os.path.basename(path)
         start = 0
-        key   = self._db_key(path)
         if resume:
-            prog = self.db.get("movies" if media_type=="movie" else "series",{})
-            info = prog.get(key, {})
-            pos  = info.get("position", 0)
-            dur  = info.get("duration", 0)
-            if dur > 0 and pos / dur < WATCHED_MARK:
+            sec   = "movies" if media_type=="movie" else "series"
+            info  = self.db.get(sec,{}).get(key,{})
+            pos   = info.get("position",0)
+            dur   = info.get("duration",0)
+            if dur > 0 and pos/dur < WATCHED_MARK:
                 start = pos
 
         self.vlc.play(path, start_pos=start)
-        if self.vlc.available:
-            self.vlc.set_volume(self.vol_var.get())
+        self.vlc.set_volume(self.vol_var.get())
 
-        self.current = {
-            "path":       path,
-            "title":      title,
-            "type":       media_type,
-            "start_time": time.time(),
-            "key":        key,
-        }
-
+        self.current = {"path":path,"title":title,
+                        "type":media_type,"key":key}
         self.now_lbl.configure(text=f"▶  {title[:40]}")
-        self.now_playing_lbl.configure(text=f"▶ {title[:24]}")
+        self.now_playing_lbl.configure(text=f"▶ {title[:22]}")
         self.play_btn.configure(text="⏸")
 
-        # add history entry
-        self.db["history"].insert(0, {
-            "title":  title,
-            "type":   media_type,
-            "date":   time.strftime("%Y-%m-%d %H:%M"),
-            "path":   path,
-            "status": "watching",
-        })
+        self.db["history"].insert(0,{"title":title,"type":media_type,
+            "date":time.strftime("%Y-%m-%d %H:%M"),"path":path,"status":"watching"})
         save_db(self.db)
         self._poll_playback()
         self._build_mini_list(path, media_type)
 
     def _poll_playback(self):
         if not self.current or not self.vlc: return
-        pos  = self.vlc.get_position()
-        cur  = self.vlc.get_time()
-        dur  = self.vlc.get_duration()
+        pos = self.vlc.get_position()
+        cur = self.vlc.get_time()
+        dur = self.vlc.get_duration()
 
-        # update seek bar
         if not self._seek_drag and dur > 0:
             self.seek_var.set(pos)
         if dur > 0:
             self.time_lbl.configure(
                 text=f"{fmt_duration(cur)} / {fmt_duration(dur)}")
 
-        # save progress
         key = self.current["key"]
-        section = "movies" if self.current["type"]=="movie" else "series"
-        if section not in self.db: self.db[section] = {}
-        self.db[section][key] = {
-            "position": cur, "duration": dur, "progress": pos,
-            "title":    self.current["title"],
-            "last_watched": time.strftime("%Y-%m-%d %H:%M"),
+        sec = "movies" if self.current["type"]=="movie" else "series"
+        self.db.setdefault(sec,{})[key] = {
+            "position":cur,"duration":dur,"progress":pos,
+            "title":self.current["title"],
+            "last_watched":time.strftime("%Y-%m-%d %H:%M"),
         }
 
-        # mark watched at 95%
         if pos >= WATCHED_MARK:
-            self.db[section][key]["watched"] = True
-            self.db[section][key]["progress"] = 1.0
-            # disable resume
-            self.db[section][key]["position"] = 0
-            self._check_season_complete(key)
+            self.db[sec][key]["watched"]  = True
+            self.db[sec][key]["progress"] = 1.0
+            self.db[sec][key]["position"] = 0
             save_db(self.db)
             self._refresh_library()
 
         save_db(self.db)
-
         if self.vlc.is_ended():
-            self._on_playback_ended()
-            return
-
+            self._on_ended(); return
         self._poll_id = self.root.after(1000, self._poll_playback)
 
-    def _on_playback_ended(self):
+    def _on_ended(self):
         if not self.current: return
-        key     = self.current["key"]
-        section = "movies" if self.current["type"]=="movie" else "series"
-        if section in self.db and key in self.db[section]:
-            self.db[section][key]["watched"]  = True
-            self.db[section][key]["progress"] = 1.0
-            self.db[section][key]["position"] = 0
+        key = self.current["key"]
+        sec = "movies" if self.current["type"]=="movie" else "series"
+        self.db.setdefault(sec,{}).setdefault(key,{}).update(
+            {"watched":True,"progress":1.0,"position":0})
         for h in self.db["history"]:
             if h.get("path") == self.current["path"]:
                 h["status"] = "watched"; break
-        save_db(self.db)
-        self._check_season_complete(key)
-        self._refresh_library()
+        save_db(self.db); self._refresh_library()
         self.current = None
 
     def _toggle_pause(self):
@@ -795,129 +984,112 @@ class CineVault:
         if hasattr(self,"player_panel"):
             self.player_panel.pack_forget()
 
-    def _on_seek_move(self, val):
-        pass  # only seek on release
-
+    def _on_seek_move(self, val): pass
     def _on_seek_release(self, e):
         self._seek_drag = False
-        if self.vlc:
-            self.vlc.seek(self.seek_var.get())
+        if self.vlc: self.vlc.seek(self.seek_var.get())
 
     # ── Mini player ───────────────────────────────────────────────────────────
     def _toggle_mini(self, e=None):
         if not hasattr(self,"player_panel"): return
-        if self.mini_mode:
-            self._exit_mini()
-        else:
-            self._enter_mini()
+        self._exit_mini() if self.mini_mode else self._enter_mini()
 
     def _enter_mini(self):
         self.mini_mode = True
-        self.video_canvas.configure(width=380, height=214)
+        self.video_canvas.configure(width=360, height=202)
         self.player_panel.pack_configure(expand=False, fill="none")
-        self.mini_list_frame.pack(side="right", fill="both", expand=True)
+        self.mini_list.pack(side="right", fill="both", expand=True)
 
     def _exit_mini(self):
         self.mini_mode = False
-        self.mini_list_frame.pack_forget()
+        self.mini_list.pack_forget()
         self.video_canvas.configure(width=0, height=0)
         self.player_panel.pack_configure(expand=True, fill="both")
 
     def _build_mini_list(self, current_path, media_type):
-        if not hasattr(self,"mini_list_frame"): return
-        for w in self.mini_list_frame.winfo_children(): w.destroy()
-        tk.Label(self.mini_list_frame,
-                 text=("Up Next" if media_type=="series" else "More Movies"),
+        if not hasattr(self,"mini_list"): return
+        for w in self.mini_list.winfo_children(): w.destroy()
+        tk.Label(self.mini_list,
+                 text="Up Next" if media_type=="series" else "More Movies",
                  font=F_UI_B, bg=BG2, fg=TEXT, pady=8).pack(fill="x", padx=10)
-
-        scroll = _ScrollFrame(self.mini_list_frame)
-        scroll.pack(fill="both", expand=True)
-        inner = scroll.inner
+        sf = ScrollFrame(self.mini_list); sf.pack(fill="both", expand=True)
+        inner = sf.inner
 
         if media_type == "movie":
-            items = scan_movies(self.cfg.get("movies_dir",""))
-            for m in items:
+            for m in scan_movies(self.cfg.get("movies_dir","")):
                 if m["path"] == current_path: continue
-                lbl = f"{m['title']} {('('+m['year']+')') if m['year'] else ''}"
-                self._mini_item(inner, lbl, m["path"], "movie")
+                self._mini_row(inner, f"{m['title']} {m.get('year','')}", m["path"], "movie")
         else:
-            # find next episode
-            series = scan_series(self.cfg.get("series_dir",""))
-            for show in series:
+            for show in scan_series(self.cfg.get("series_dir","")):
                 for snum in sorted(show["seasons"]):
                     for ep in show["seasons"][snum]:
                         if ep["path"] == current_path: continue
                         lbl = f"{show['show']} S{snum:02d}E{ep['ep']:02d}"
-                        self._mini_item(inner, lbl, ep["path"], "series")
+                        self._mini_row(inner, lbl, ep["path"], "series")
 
-    def _mini_item(self, parent, label, path, media_type):
+    def _mini_row(self, parent, label, path, mtype):
         f = tk.Frame(parent, bg=BG2, cursor="hand2")
-        f.pack(fill="x", padx=8, pady=2)
+        f.pack(fill="x", padx=6, pady=2)
         tk.Label(f, text=label, font=F_UI, bg=BG2, fg=TEXT2,
-                 wraplength=220, justify="left").pack(side="left", padx=8, pady=6)
-
-        def _queue():
-            self._queued = (path, label, media_type)
-            for w in f.winfo_children(): w.configure(fg=GOLD)
-        def _play_now():
-            self._play(path, label, media_type)
-
-        f.bind("<Button-1>",        lambda e: _queue())
-        f.bind("<Double-Button-1>", lambda e: _play_now())
-        for c in f.winfo_children():
-            c.bind("<Button-1>",        lambda e: _queue())
-            c.bind("<Double-Button-1>", lambda e: _play_now())
-        f.bind("<Enter>", lambda e: f.configure(bg=CARD_H))
-        f.bind("<Leave>", lambda e: f.configure(bg=BG2))
+                 wraplength=230, justify="left").pack(side="left", padx=8, pady=6)
+        f.bind("<Button-1>",        lambda e: setattr(self,"_queued",(path,label,mtype)))
+        f.bind("<Double-Button-1>", lambda e: self._play(path,label,mtype))
+        f.bind("<Enter>",           lambda e: f.configure(bg=CARD_H_C))
+        f.bind("<Leave>",           lambda e: f.configure(bg=BG2))
 
     # ══════════════════════════════════════════════════════════════════════════
-    #  LIBRARY
+    #  LIBRARY POPULATION
     # ══════════════════════════════════════════════════════════════════════════
-    def _refresh_library(self):
-        self._populate_movies()
-        self._populate_series()
-        self._populate_home()
-        self._populate_history()
-
-    def _db_key(self, path):
-        return os.path.basename(path)
-
+    def _db_key(self, path):   return os.path.basename(path)
+    def _get_progress(self, path):
+        key = self._db_key(path)
+        for sec in ("movies","series"):
+            p = self.db.get(sec,{}).get(key,{}).get("progress",0)
+            if p > 0: return p
+        return 0.0
     def _get_status(self, path):
         key = self._db_key(path)
-        for section in ("movies","series"):
-            info = self.db.get(section,{}).get(key,{})
+        for sec in ("movies","series"):
+            info = self.db.get(sec,{}).get(key,{})
             if info.get("watched"): return "watched"
             if info.get("progress",0) > 0.01: return "watching"
         return "unwatched"
 
-    def _get_progress(self, path):
-        key = self._db_key(path)
-        for section in ("movies","series"):
-            info = self.db.get(section,{}).get(key,{})
-            if info.get("progress",0) > 0: return info["progress"]
-        return 0.0
+    def _get_thumb(self, path, title=""):
+        """Return thumb path, extracting from video if needed."""
+        tp = str(thumb_path(path))
+        if os.path.isfile(tp): return tp
+        # Extract in background
+        def _ex():
+            result = extract_thumb(path)
+        threading.Thread(target=_ex, daemon=True).start()
+        return None
+
+    def _card_row(self, parent):
+        """Start a new horizontal card row."""
+        row = tk.Frame(parent, bg=BG)
+        row.pack(anchor="w", padx=16, pady=6)
+        return row
 
     def _populate_movies(self):
-        inner   = self.movies_inner
-        watched = self.movies_watched_inner
-        for w in inner.winfo_children():   w.destroy()
-        for w in watched.winfo_children(): w.destroy()
+        for w in self.mov_scroll.inner.winfo_children(): w.destroy()
+        for w in self.mov_watched_scroll.inner.winfo_children(): w.destroy()
 
-        search  = self.movies_search.get().lower()
-        sort    = self.movies_sort.get()
-        filt    = self.movies_filter.get()
-        movies  = scan_movies(self.cfg.get("movies_dir",""))
+        search = self.mov_search.get().lower()
+        sort   = self.mov_sort.get()
+        filt   = self.mov_filter.get()
+        movies = scan_movies(self.cfg.get("movies_dir",""))
 
-        # sort
-        if sort == "Name":           movies.sort(key=lambda m: m["title"])
+        if sort == "Name":            movies.sort(key=lambda m: m["title"])
         elif sort == "Recently Added": movies = list(reversed(movies))
         elif sort == "Last Watched":
             movies.sort(key=lambda m: self.db.get("movies",{}).get(
                 self._db_key(m["path"]),{}).get("last_watched",""), reverse=True)
 
-        row_w = None; row_i = 0
-        row_w2 = None; row_i2 = 0
-        COLS = 4
+        lib_row = self._card_row(self.mov_scroll.inner)
+        wat_row = self._card_row(self.mov_watched_scroll.inner)
+        lib_count = wat_count = 0
+        COLS = 5
 
         for m in movies:
             if search and search not in m["title"].lower(): continue
@@ -925,85 +1097,138 @@ class CineVault:
             progress = self._get_progress(m["path"])
             if filt != "All" and status != filt.lower(): continue
 
-            sub = m["year"] if m["year"] else ""
-            card = TitleCard(
-                inner if status != "watched" else watched,
-                m["title"], sub, progress, status,
-                on_play=lambda p=m["path"],t=m["title"]: self._play(p,t,"movie"),
-                on_right_click=lambda e,p=m["path"],t=m["title"]: self._right_click(e,p,t,"movie"),
-                width=180, height=130)
+            sub  = m["year"] if m["year"] else ""
+            tp   = self._get_thumb(m["path"], m["title"])
+            dest = self.mov_scroll.inner if status != "watched" else self.mov_watched_scroll.inner
 
-            target = inner if status != "watched" else watched
-            ri     = row_i if status != "watched" else row_i2
+            if status != "watched":
+                if lib_count % COLS == 0 and lib_count > 0:
+                    lib_row = self._card_row(self.mov_scroll.inner)
+                row = lib_row; lib_count += 1
+            else:
+                if wat_count % COLS == 0 and wat_count > 0:
+                    wat_row = self._card_row(self.mov_watched_scroll.inner)
+                row = wat_row; wat_count += 1
 
-            if ri % COLS == 0:
-                new_row = tk.Frame(target, bg=BG)
-                new_row.pack(anchor="w", pady=4)
-                if status != "watched": row_w = new_row
-                else:                   row_w2 = new_row
+            p = m["path"]; t = m["title"]
+            MediaCard(row, t, sub, tp, progress, status,
+                      on_click=lambda p=p,t=t: self._play(p,t,"movie"),
+                      on_right_click=lambda e,p=p,t=t: self._right_click(e,p,t,"movie")
+                      ).pack(side="left", padx=4)
 
-            dest_row = row_w if status != "watched" else row_w2
-            card_copy = TitleCard(
-                dest_row, m["title"], sub, progress, status,
-                on_play=lambda p=m["path"],t=m["title"]: self._play(p,t,"movie"),
-                on_right_click=lambda e,p=m["path"],t=m["title"]: self._right_click(e,p,t,"movie"),
-                width=180, height=130)
-            card_copy.pack(side="left", padx=6)
+    def _populate_series_list(self):
+        """Show top-level series cards."""
+        self._clear_series_content()
+        self._build_series_toolbar(back=False)
+        self._cur_series = None; self._cur_season = None
 
-            if status != "watched": row_i += 1
-            else:                   row_i2 += 1
-
-    def _populate_series(self):
-        inner   = self.series_inner
-        watched = self.series_watched_inner
-        for w in inner.winfo_children():   w.destroy()
-        for w in watched.winfo_children(): w.destroy()
-
-        search = self.series_search.get().lower()
-        sort   = self.series_sort.get()
-        filt   = self.series_filter.get()
+        search = self.ser_search.get().lower() if hasattr(self,"ser_search") else ""
+        sort   = self.ser_sort.get() if hasattr(self,"ser_sort") else "Name"
         series = scan_series(self.cfg.get("series_dir",""))
-
         if sort == "Name": series.sort(key=lambda s: s["show"])
 
+        sf = ScrollFrame(self.series_content)
+        sf.pack(fill="both", expand=True)
+        inner = sf.inner
+
+        row = self._card_row(inner)
+        count = 0; COLS = 5
         for show in series:
             if search and search not in show["show"].lower(): continue
 
-            # season selector
-            all_watched = True
-            for snum in sorted(show["seasons"]):
-                eps        = show["seasons"][snum]
-                s_watched  = all(self._get_status(ep["path"])=="watched" for ep in eps)
-                if not s_watched: all_watched = False
+            # Overall show status
+            all_eps  = [ep for sn in show["seasons"].values() for ep in sn]
+            watched  = sum(1 for ep in all_eps if self._get_status(ep["path"])=="watched")
+            progress = watched / len(all_eps) if all_eps else 0
+            status   = "watched" if progress >= 1.0 else ("watching" if progress > 0 else "unwatched")
 
-                s_status  = "watched" if s_watched else (
-                    "watching" if any(self._get_progress(ep["path"])>0.01 for ep in eps)
-                    else "unwatched")
-                if filt != "All" and s_status != filt.lower(): continue
+            # Show poster — use first episode thumb or show folder art
+            first_ep = all_eps[0]["path"] if all_eps else ""
+            tp = self._get_thumb(first_ep, show["show"]) if first_ep else None
 
-                target = watched if s_watched else inner
-                sec_lbl = tk.Label(target,
-                    text=f"  {show['show']}  —  Season {snum}",
-                    font=F_UI_B, bg=BG, fg=TEXT2)
-                sec_lbl.pack(anchor="w", padx=16, pady=(10,2))
+            if count % COLS == 0 and count > 0:
+                row = self._card_row(inner)
 
-                row = tk.Frame(target, bg=BG); row.pack(anchor="w", padx=16, pady=4)
-                for ep in eps:
-                    prog    = self._get_progress(ep["path"])
-                    status  = self._get_status(ep["path"])
-                    ep_lbl  = f"E{ep['ep']:02d}"
-                    card    = TitleCard(
-                        row, ep_lbl,
-                        f"{show['show']} S{snum}E{ep['ep']:02d}",
-                        prog, status,
-                        on_play=lambda p=ep["path"],t=f"{show['show']} S{snum:02d}E{ep['ep']:02d}": self._play(p,t,"series"),
-                        on_right_click=lambda e,p=ep["path"],t=f"{show['show']} S{snum:02d}E{ep['ep']:02d}": self._right_click(e,p,t,"series"),
-                        width=120, height=110)
-                    card.pack(side="left", padx=4)
+            s = show
+            MediaCard(row, show["show"],
+                      f"{len(show['seasons'])} Season(s) · {len(all_eps)} Episodes",
+                      tp, progress, status,
+                      on_click=lambda s=s: self._show_series_seasons(s),
+                      on_right_click=None
+                      ).pack(side="left", padx=4)
+            count += 1
+
+    def _show_series_seasons(self, show):
+        """Show season cards for a selected series."""
+        self._cur_series = show
+        self._cur_season = None
+        self._clear_series_content()
+        self._build_series_toolbar(back=True, title=f"📺  {show['show']}")
+
+        sf = ScrollFrame(self.series_content)
+        sf.pack(fill="both", expand=True)
+        inner = sf.inner
+
+        tk.Label(inner, text="Seasons", font=F_HEAD,
+                 bg=BG, fg=TEXT, pady=10).pack(anchor="w", padx=16)
+
+        row = self._card_row(inner)
+        COLS = 5
+        for i, snum in enumerate(sorted(show["seasons"])):
+            eps      = show["seasons"][snum]
+            watched  = sum(1 for ep in eps if self._get_status(ep["path"])=="watched")
+            progress = watched / len(eps) if eps else 0
+            status   = "watched" if progress >= 1.0 else ("watching" if progress > 0 else "unwatched")
+            first_ep = eps[0]["path"] if eps else ""
+            tp = self._get_thumb(first_ep, show["show"]) if first_ep else None
+
+            if i % COLS == 0 and i > 0:
+                row = self._card_row(inner)
+
+            sn = snum
+            MediaCard(row, f"Season {snum}",
+                      f"{len(eps)} Episodes · {int(progress*100)}% watched",
+                      tp, progress, status,
+                      on_click=lambda sn=sn: self._show_season_episodes(show, sn)
+                      ).pack(side="left", padx=4)
+
+    def _show_season_episodes(self, show, snum):
+        """Show episode cards for a selected season."""
+        self._cur_season = snum
+        self._clear_series_content()
+        self._build_series_toolbar(
+            back=True,
+            title=f"📺  {show['show']}  ›  Season {snum}")
+
+        sf = ScrollFrame(self.series_content)
+        sf.pack(fill="both", expand=True)
+        inner = sf.inner
+
+        eps = show["seasons"][snum]
+        row = self._card_row(inner)
+        COLS = 5
+        for i, ep in enumerate(eps):
+            progress = self._get_progress(ep["path"])
+            status   = self._get_status(ep["path"])
+            tp       = self._get_thumb(ep["path"])
+            ep_label = f"E{ep['ep']:02d}"
+            ep_title = f"{show['show']} S{snum:02d}E{ep['ep']:02d}"
+
+            if i % COLS == 0 and i > 0:
+                row = self._card_row(inner)
+
+            p = ep["path"]; t = ep_title
+            MediaCard(row, ep_label, ep_title,
+                      tp, progress, status,
+                      on_click=lambda p=p,t=t: self._play(p,t,"series"),
+                      on_right_click=lambda e,p=p,t=t: self._right_click(e,p,t,"series")
+                      ).pack(side="left", padx=4)
 
     def _populate_home(self):
+        for w in self.continue_row.winfo_children(): w.destroy()
+        for w in self.recent_row.winfo_children(): w.destroy()
+
         # Continue watching
-        for w in self.continue_frame.winfo_children(): w.destroy()
         seen = set()
         for h in self.db.get("history",[])[:20]:
             p = h.get("path","")
@@ -1011,119 +1236,145 @@ class CineVault:
             seen.add(p)
             prog   = self._get_progress(p)
             status = self._get_status(p)
-            if status in ("watching",) and prog < WATCHED_MARK:
-                card = TitleCard(
-                    self.continue_frame, h["title"], h.get("date",""),
-                    prog, status,
-                    on_play=lambda p2=p,t=h["title"],tp=h["type"]: self._play(p2,t,tp),
-                    on_right_click=lambda e,p2=p,t=h["title"],tp=h["type"]: self._right_click(e,p2,t,tp),
-                    width=180, height=130)
-                card.pack(side="left", padx=6)
+            if status == "watching" and prog < WATCHED_MARK:
+                tp = self._get_thumb(p, h["title"])
+                t  = h["title"]; mt = h["type"]
+                MediaCard(self.continue_row, t, h.get("date",""),
+                          tp, prog, status,
+                          on_click=lambda p=p,t=t,mt=mt: self._play(p,t,mt)
+                          ).pack(side="left", padx=6)
 
-        # Recently added
-        for w in self.recent_frame.winfo_children(): w.destroy()
-        movies = list(reversed(scan_movies(self.cfg.get("movies_dir",""))))[:8]
-        for m in movies:
+        # Recently added movies
+        for m in list(reversed(scan_movies(self.cfg.get("movies_dir",""))))[:6]:
             prog   = self._get_progress(m["path"])
             status = self._get_status(m["path"])
-            card   = TitleCard(
-                self.recent_frame, m["title"], m.get("year",""),
-                prog, status,
-                on_play=lambda p=m["path"],t=m["title"]: self._play(p,t,"movie"),
-                on_right_click=lambda e,p=m["path"],t=m["title"]: self._right_click(e,p,t,"movie"),
-                width=180, height=130)
-            card.pack(side="left", padx=6)
+            tp     = self._get_thumb(m["path"], m["title"])
+            p = m["path"]; t = m["title"]
+            MediaCard(self.recent_row, t, m.get("year",""),
+                      tp, prog, status,
+                      on_click=lambda p=p,t=t: self._play(p,t,"movie")
+                      ).pack(side="left", padx=6)
 
     def _populate_history(self):
         self.hist_tree.delete(*self.hist_tree.get_children())
         for h in self.db.get("history",[]):
-            dur = ""
             key = self._db_key(h.get("path",""))
+            dur = ""
             for sec in ("movies","series"):
                 info = self.db.get(sec,{}).get(key,{})
                 if info.get("duration"):
                     dur = fmt_duration(info["duration"]); break
-            self.hist_tree.insert("", "end", values=(
-                h.get("title",""), h.get("type",""),
-                h.get("date",""), dur, h.get("status","")))
+            self.hist_tree.insert("","end", values=(
+                h.get("title",""),h.get("type",""),
+                h.get("date",""),dur,h.get("status","")))
 
-    def _filter_library(self, kind):
-        if kind == "movies": self._populate_movies()
-        else:                self._populate_series()
+    def _refresh_library(self):
+        self._populate_movies()
+        self._populate_home()
+        self._populate_history()
+        # Refresh whichever series view is active
+        if self._cur_season is not None and self._cur_series is not None:
+            self._show_season_episodes(self._cur_series, self._cur_season)
+        elif self._cur_series is not None:
+            self._show_series_seasons(self._cur_series)
+        else:
+            self._populate_series_list()
 
-    # ── Season complete check ─────────────────────────────────────────────────
-    def _check_season_complete(self, key):
-        """If all eps in a season are watched, mark season complete."""
+    # ══════════════════════════════════════════════════════════════════════════
+    #  TMDB REFRESH (manual)
+    # ══════════════════════════════════════════════════════════════════════════
+    def _tmdb_refresh_movies(self):
+        key = self.cfg.get("tmdb_key","")
+        if not key:
+            messagebox.showwarning("No TMDB Key",
+                "Add your TMDB API key in Settings first."); return
+        movies = scan_movies(self.cfg.get("movies_dir",""))
+        def _run():
+            for m in movies:
+                tp   = str(thumb_path(m["path"]))
+                url  = tmdb_poster(m["title"], m.get("year"), key)
+                if url: download_image(url, tp)
+            self.root.after(0, self._populate_movies)
+        threading.Thread(target=_run, daemon=True).start()
+        messagebox.showinfo("TMDB Refresh","Fetching posters in background…")
+
+    def _tmdb_refresh_series(self):
+        key = self.cfg.get("tmdb_key","")
+        if not key:
+            messagebox.showwarning("No TMDB Key",
+                "Add your TMDB API key in Settings first."); return
         series = scan_series(self.cfg.get("series_dir",""))
-        for show in series:
-            for snum, eps in show["seasons"].items():
-                if any(self._db_key(ep["path"])==key for ep in eps):
-                    if all(self.db.get("series",{}).get(
-                           self._db_key(ep["path"]),{}).get("watched") for ep in eps):
-                        # mark whole season
-                        for ep in eps:
-                            k2 = self._db_key(ep["path"])
-                            self.db.setdefault("series",{})\
-                                   .setdefault(k2,{})["season_complete"] = True
-                        save_db(self.db)
+        def _run():
+            for show in series:
+                # Use show poster for all episodes in the show
+                url = tmdb_tv_poster(show["show"], key)
+                if url:
+                    for snum in show["seasons"]:
+                        for ep in show["seasons"][snum]:
+                            tp = str(thumb_path(ep["path"]))
+                            if not os.path.isfile(tp):
+                                download_image(url, tp)
+            self.root.after(0, self._populate_series_list)
+        threading.Thread(target=_run, daemon=True).start()
+        messagebox.showinfo("TMDB Refresh","Fetching series posters in background…")
 
-    # ── Right-click menu ──────────────────────────────────────────────────────
-    def _right_click(self, event, path, title, media_type):
+    # ══════════════════════════════════════════════════════════════════════════
+    #  RIGHT-CLICK MENU
+    # ══════════════════════════════════════════════════════════════════════════
+    def _right_click(self, event, path, title, mtype):
         menu = tk.Menu(self.root, tearoff=0, bg=CARD, fg=TEXT,
                        activebackground=ACCENT, activeforeground="white",
                        font=F_UI, relief="flat")
-        key     = self._db_key(path)
-        section = "movies" if media_type=="movie" else "series"
-        has_resume = self.db.get(section,{}).get(key,{}).get("position",0) > 0
+        key  = self._db_key(path)
+        sec  = "movies" if mtype=="movie" else "series"
+        info = self.db.get(sec,{}).get(key,{})
+        pos  = info.get("position",0)
 
         menu.add_command(label="▶  Play",
-                         command=lambda: self._play(path,title,media_type))
+                         command=lambda: self._play(path,title,mtype))
         menu.add_command(label="✓  Mark as Watched",
-                         command=lambda: self._mark_watched(path,media_type))
-        menu.add_separator()
-        if has_resume:
-            menu.add_command(label="↩  Resume from " + fmt_duration(
-                self.db[section][key]["position"]),
-                command=lambda: self._play(path,title,media_type,resume=True))
+                         command=lambda: self._mark_watched(path,mtype))
+        if pos > 0:
+            menu.add_command(label=f"↩  Resume from {fmt_duration(pos)}",
+                             command=lambda: self._play(path,title,mtype,resume=True))
             menu.add_command(label="✕  Clear Resume Point",
-                command=lambda: self._clear_resume(path,media_type))
+                             command=lambda: self._clear_resume(path,mtype))
         menu.add_separator()
         menu.add_command(label="📁  Open Folder",
                          command=lambda: subprocess.Popen(
                              f'explorer /select,"{path}"'))
         menu.add_separator()
         menu.add_command(label="🗑  Remove from Library",
-                         command=lambda: self._remove_from_library(path,media_type))
+                         command=lambda: self._remove(path,mtype))
         menu.add_command(label="❌  Delete File",
-                         command=lambda: self._delete_file(path,media_type))
+                         command=lambda: self._delete_file(path,mtype))
         menu.tk_popup(event.x_root, event.y_root)
 
-    def _mark_watched(self, path, media_type):
+    def _mark_watched(self, path, mtype):
         key = self._db_key(path)
-        sec = "movies" if media_type=="movie" else "series"
+        sec = "movies" if mtype=="movie" else "series"
         self.db.setdefault(sec,{}).setdefault(key,{}).update(
             {"watched":True,"progress":1.0,"position":0})
         save_db(self.db); self._refresh_library()
 
-    def _clear_resume(self, path, media_type):
+    def _clear_resume(self, path, mtype):
         key = self._db_key(path)
-        sec = "movies" if media_type=="movie" else "series"
+        sec = "movies" if mtype=="movie" else "series"
         self.db.setdefault(sec,{}).setdefault(key,{})["position"] = 0
         save_db(self.db)
 
-    def _remove_from_library(self, path, media_type):
+    def _remove(self, path, mtype):
         key = self._db_key(path)
-        sec = "movies" if media_type=="movie" else "series"
+        sec = "movies" if mtype=="movie" else "series"
         self.db.get(sec,{}).pop(key, None)
         save_db(self.db); self._refresh_library()
 
-    def _delete_file(self, path, media_type):
+    def _delete_file(self, path, mtype):
         if messagebox.askyesno("Delete File",
             f"Permanently delete:\n{os.path.basename(path)}\n\nThis cannot be undone.",
             icon="warning"):
             try:
-                os.remove(path)
-                self._remove_from_library(path, media_type)
+                os.remove(path); self._remove(path, mtype)
             except Exception as e:
                 messagebox.showerror("Error", str(e))
 
@@ -1132,49 +1383,53 @@ class CineVault:
             self.db["history"] = []
             save_db(self.db); self._populate_history()
 
-    # ── Settings ──────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    #  SETTINGS
+    # ══════════════════════════════════════════════════════════════════════════
     def _browse_setting(self, key, var):
-        if key == "vlc_path":
+        if key in ("vlc_path",):
             p = filedialog.askopenfilename(
-                title="Select VLC (libvlc.dll or vlc.exe)",
-                filetypes=[("VLC files","*.dll *.exe"),("All","*.*")])
+                title="Select vlc.exe",
+                filetypes=[("VLC","vlc.exe *.exe *.dll"),("All","*.*")])
         else:
             p = filedialog.askdirectory(title=f"Select {key}")
         if p: var.set(p)
 
     def _save_settings(self):
-        for k, v in self._setting_vars.items():
+        for k,v in self._svars.items():
             self.cfg[k] = v.get()
         save_cfg(self.cfg)
-        self._init_vlc()
-        messagebox.showinfo("Saved","Settings saved!")
+        # Reload VLC
+        vlc_path = self.cfg.get("vlc_path","")
+        if vlc_path:
+            ok, msg = self.vlc.load(vlc_path)
+            self.cfg["vlc_status"] = "" if ok else f"⚠ {msg}"
+            save_cfg(self.cfg)
+        self.vlc_status_lbl.configure(
+            text=self._vlc_status_text(),
+            fg=GREEN if self.vlc.available else ACCENT)
         self._refresh_library()
+        messagebox.showinfo("Saved","Settings saved!")
 
-    # ── Navigation ────────────────────────────────────────────────────────────
-    def _show_page(self, name):
-        if self._current_page:
-            self._current_page.pack_forget()
-        self.pages[name].pack(fill="both", expand=True)
-        self._current_page = self.pages[name]
-        for n, btn in self.nav_btns.items():
-            btn.configure(bg=CARD if n==name else "#08080f",
-                          fg=TEXT if n==name else TEXT2)
-
-    # ── Keyboard ──────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    #  KEYBOARD & WINDOW
+    # ══════════════════════════════════════════════════════════════════════════
     def _on_key(self, e):
-        key = e.keysym
-        if key == "space":           self._toggle_pause()
-        elif key == "Escape":
-            if self.mini_mode: self._exit_mini()
-        elif key == "f" or key=="F": self._toggle_fullscreen()
-        elif key == "Right":
-            if self.vlc: self.vlc.seek(min(1.0, self.vlc.get_position()+0.02))
-        elif key == "Left":
-            if self.vlc: self.vlc.seek(max(0.0, self.vlc.get_position()-0.02))
+        k = e.keysym
+        if k == "space":                    self._toggle_pause()
+        elif k == "Escape":
+            if self.mini_mode:              self._exit_mini()
+        elif k in ("f","F"):                self._toggle_fs()
+        elif k == "Right" and self.vlc:     self.vlc.seek(min(1.0,self.vlc.get_position()+0.02))
+        elif k == "Left"  and self.vlc:     self.vlc.seek(max(0.0,self.vlc.get_position()-0.02))
 
-    def _toggle_fullscreen(self):
-        state = self.root.attributes("-fullscreen")
-        self.root.attributes("-fullscreen", not state)
+    def _toggle_fs(self):
+        self.root.attributes("-fullscreen",
+            not self.root.attributes("-fullscreen"))
+
+    def _toggle_mini(self, e=None):
+        if not hasattr(self,"player_panel"): return
+        self._exit_mini() if self.mini_mode else self._enter_mini()
 
     def _on_resize(self, e):
         if e.widget == self.root:
@@ -1182,36 +1437,19 @@ class CineVault:
 
     def on_close(self):
         if self.vlc: self.vlc.stop()
-        save_cfg(self.cfg)
-        save_db(self.db)
+        save_cfg(self.cfg); save_db(self.db)
         self.root.destroy()
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  SCROLL FRAME HELPER
-# ═══════════════════════════════════════════════════════════════════════════════
-class _ScrollFrame(tk.Frame):
-    def __init__(self, parent, height=None, **kw):
-        kw.setdefault("bg", BG)
-        super().__init__(parent, **kw)
-        if height: self.configure(height=height)
-
-        self.canvas = tk.Canvas(self, bg=BG, highlightthickness=0)
-        sb = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
-        self.inner = tk.Frame(self.canvas, bg=BG)
-        self.inner.bind("<Configure>",
-            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.canvas.create_window((0,0), window=self.inner, anchor="nw")
-        self.canvas.configure(yscrollcommand=sb.set)
-        self.canvas.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-        self.canvas.bind("<MouseWheel>",
-            lambda e: self.canvas.yview_scroll(-1*(e.delta//120),"units"))
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════════════
-if __name__ == "__main__":
+def launch_main():
     root = tk.Tk()
     app  = CineVault(root)
     root.protocol("WM_DELETE_WINDOW", app.on_close)
     root.mainloop()
+
+if __name__ == "__main__":
+    splash = tk.Tk()
+    SplashScreen(splash, on_done=launch_main)
+    splash.mainloop()
